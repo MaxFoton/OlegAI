@@ -12,12 +12,12 @@ build/
 *.log
 logs/
 
-# Databases (слишком большие для git)
+# Databases (персональные данные, не для git)
 *.sqlite
 *.db
 
-# Models (большие бинарники)
-*.pkl
+# Models - модель lightgbm_scorer.pkl включена в репозиторий
+# *.pkl
 *.joblib
 *.h5
 
