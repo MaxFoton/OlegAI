@@ -1,0 +1,193 @@
+{
+  "used": true,
+  "feature_names": [
+    "scanner_score",
+    "regime_score",
+    "micro_score",
+    "trigger_score",
+    "confidence",
+    "volatility",
+    "volume_spike",
+    "absorption_score",
+    "lor_signal",
+    "lor_strength",
+    "lor_prediction",
+    "volume_slope",
+    "delta_slope",
+    "distance_from_ema20",
+    "distance_from_vwap",
+    "rsi",
+    "htf_trend_1h",
+    "direction_long",
+    "phase_early_expansion",
+    "phase_mid_expansion",
+    "phase_late_expansion",
+    "phase_exhaustion",
+    "long_x_early_expansion",
+    "short_x_early_expansion",
+    "long_x_mid_expansion",
+    "short_x_mid_expansion",
+    "long_x_late_expansion",
+    "short_x_late_expansion",
+    "long_x_exhaustion",
+    "short_x_exhaustion"
+  ],
+  "numeric_features": [
+    "scanner_score",
+    "regime_score",
+    "micro_score",
+    "trigger_score",
+    "confidence",
+    "volatility",
+    "volume_spike",
+    "absorption_score",
+    "lor_signal",
+    "lor_strength",
+    "lor_prediction",
+    "volume_slope",
+    "delta_slope",
+    "distance_from_ema20",
+    "distance_from_vwap",
+    "rsi",
+    "htf_trend_1h"
+  ],
+  "phase_values": [
+    "EARLY_EXPANSION",
+    "MID_EXPANSION",
+    "LATE_EXPANSION",
+    "EXHAUSTION"
+  ],
+  "n_total": 7485,
+  "n_train": 5988,
+  "n_test": 1497,
+  "win_rate": 0.4283233132932532,
+  "cv_auc_mean": 0.0,
+  "cv_auc_std": 0.0,
+  "cv_acc_mean": 0.0,
+  "holdout_auc": 0.5971302870806421,
+  "holdout_accuracy": 0.5965263861055444,
+  "scale_pos_weight": 1.3346849656893325,
+  "best_iteration": 22,
+  "feature_importance": [
+    {
+      "feature": "micro_score",
+      "importance": 53
+    },
+    {
+      "feature": "volatility",
+      "importance": 47
+    },
+    {
+      "feature": "lor_strength",
+      "importance": 35
+    },
+    {
+      "feature": "distance_from_vwap",
+      "importance": 35
+    },
+    {
+      "feature": "volume_slope",
+      "importance": 32
+    },
+    {
+      "feature": "volume_spike",
+      "importance": 30
+    },
+    {
+      "feature": "rsi",
+      "importance": 29
+    },
+    {
+      "feature": "delta_slope",
+      "importance": 28
+    },
+    {
+      "feature": "scanner_score",
+      "importance": 27
+    },
+    {
+      "feature": "trigger_score",
+      "importance": 26
+    },
+    {
+      "feature": "distance_from_ema20",
+      "importance": 23
+    },
+    {
+      "feature": "long_x_exhaustion",
+      "importance": 15
+    },
+    {
+      "feature": "long_x_late_expansion",
+      "importance": 13
+    },
+    {
+      "feature": "short_x_exhaustion",
+      "importance": 10
+    },
+    {
+      "feature": "phase_late_expansion",
+      "importance": 9
+    },
+    {
+      "feature": "absorption_score",
+      "importance": 8
+    },
+    {
+      "feature": "long_x_early_expansion",
+      "importance": 8
+    },
+    {
+      "feature": "lor_prediction",
+      "importance": 8
+    },
+    {
+      "feature": "regime_score",
+      "importance": 7
+    },
+    {
+      "feature": "short_x_late_expansion",
+      "importance": 7
+    },
+    {
+      "feature": "direction_long",
+      "importance": 3
+    },
+    {
+      "feature": "long_x_mid_expansion",
+      "importance": 2
+    },
+    {
+      "feature": "phase_mid_expansion",
+      "importance": 2
+    },
+    {
+      "feature": "lor_signal",
+      "importance": 1
+    },
+    {
+      "feature": "phase_exhaustion",
+      "importance": 1
+    },
+    {
+      "feature": "confidence",
+      "importance": 0
+    },
+    {
+      "feature": "phase_early_expansion",
+      "importance": 0
+    },
+    {
+      "feature": "htf_trend_1h",
+      "importance": 0
+    },
+    {
+      "feature": "short_x_mid_expansion",
+      "importance": 0
+    },
+    {
+      "feature": "short_x_early_expansion",
+      "importance": 0
+    }
+  ]
+}
