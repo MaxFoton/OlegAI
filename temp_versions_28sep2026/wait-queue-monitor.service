@@ -1,0 +1,16 @@
+[Unit]
+Description=Freqtrade Wait Queue Monitor
+After=network.target
+
+[Service]
+Type=simple
+User=max
+WorkingDirectory=/home/max/freqtrade
+ExecStart=/home/max/freqtrade/.venv/bin/python3 /home/max/freqtrade/mcp_signal_analyzer/wait_queue_monitor.py --watch --interval 15
+Restart=always
+RestartSec=10
+StandardOutput=append:/home/max/freqtrade/logs/wait_monitor.log
+StandardError=append:/home/max/freqtrade/logs/wait_monitor_error.log
+
+[Install]
+WantedBy=multi-user.target
