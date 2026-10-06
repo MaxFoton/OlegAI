@@ -45,18 +45,19 @@ def save_last_position(position: int):
 def extract_signal_from_log_line(line: str) -> dict | None:
     """Extract signal data from SIGNAL_DECISION log line"""
     try:
-        # Parse: SIGNAL_DECISION base=FLR dir=LONG kind=vol_anomaly score=9 price=0.00603000
+        # Parse: SIGNAL_ID=FLR_LONG_20260928123456 SIGNAL_DECISION base=FLR dir=LONG kind=vol_anomaly score=9 price=0.00603000
         match = re.search(
-            r'SIGNAL_DECISION\s+base=(\w+)\s+dir=(\w+)\s+kind=(\w+)\s+score=(\d+)\s+price=([\d.]+)',
+            r'SIGNAL_ID=(\w+)\s+SIGNAL_DECISION\s+base=(\w+)\s+dir=(\w+)\s+kind=(\w+)\s+score=(\d+)\s+price=([\d.]+)',
             line
         )
         
         if not match:
             return None
         
-        symbol, direction, kind, score, price = match.groups()
+        signal_id, symbol, direction, kind, score, price = match.groups()
         
         return {
+            'signal_id': signal_id,  # 🔥 FIX: добавлен signal_id
             'symbol': symbol,
             'direction': direction,
             'kind': kind,
@@ -64,7 +65,8 @@ def extract_signal_from_log_line(line: str) -> dict | None:
             'price': float(price),
             'timestamp': datetime.now(timezone.utc).isoformat(),
             'log_line': line.strip(),
-            'details': []  # Будем собирать следующие строки
+            'details': [],  # Будем собирать следующие строки
+            'features': {}  # 🔥 FIX: будем парсить из SIGNAL_FEATURES
         }
     except Exception as e:
         logger.error(f"Error parsing line: {e}")
@@ -87,6 +89,77 @@ def parse_signal_details(lines: list[str]) -> str:
                     details.append(text)
     
     return '\n'.join(details)
+
+
+async def preload_candles_for_funtik(symbol: str, direction: str):
+    """
+    Предзагрузка свечей для Фунтика ПЕРЕД отправкой сигнала.
+    Загружает 100x5m, 50x15m, 50x1h через ccxt и сохраняет в формате Freqtrade.
+    """
+    try:
+        import ccxt.async_support as ccxt
+        from pathlib import Path
+        
+        # Создаём биржу
+        exchange = ccxt.bybit({
+            'enableRateLimit': True,
+            'options': {'defaultType': 'swap'}
+        })
+        
+        # Путь для сохранения
+        data_dir = Path("/home/max/freqtrade/user_data/data/bybit")
+        data_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Формат пары для Bybit
+        pair = f"{symbol}/USDT:USDT"
+        
+        # Таймфреймы и количество свечей
+        timeframes = {
+            '5m': 100,
+            '15m': 50,
+            '1h': 50
+        }
+        
+        logger.info(f"📥 Preloading candles for {symbol} ({direction})...")
+        
+        for timeframe, limit in timeframes.items():
+            try:
+                # Загружаем свечи
+                ohlcv = await exchange.fetch_ohlcv(pair, timeframe, limit=limit)
+                
+                # Конвертируем в формат Freqtrade: [[timestamp, open, high, low, close, volume], ...]
+                freqtrade_data = []
+                for candle in ohlcv:
+                    freqtrade_data.append([
+                        candle[0],  # timestamp (ms)
+                        candle[1],  # open
+                        candle[2],  # high
+                        candle[3],  # low
+                        candle[4],  # close
+                        candle[5]   # volume
+                    ])
+                
+                # Имя файла: SYMBOL_USDT_USDT-timeframe.json
+                filename = f"{symbol}_USDT_USDT-{timeframe}.json"
+                filepath = data_dir / filename
+                
+                # Сохраняем
+                with filepath.open('w') as f:
+                    json.dump(freqtrade_data, f)
+                
+                logger.info(f"  ✅ {timeframe}: {len(freqtrade_data)} candles → {filename}")
+                
+            except Exception as e:
+                logger.error(f"  ❌ Failed to load {timeframe}: {e}")
+        
+        await exchange.close()
+        logger.info(f"✅ Preload complete for {symbol}")
+        
+    except Exception as e:
+        logger.error(f"❌ Preload failed for {symbol}: {e}")
+
+
+
 
 
 async def add_to_queue(signal: dict):
@@ -122,6 +195,9 @@ async def add_to_queue(signal: dict):
             f"уже {recent_signals} сигналов за последний час, пропускаем"
         )
         return
+    
+    # 🔥 ПРЕДЗАГРУЗКА СВЕЧЕЙ ДЛЯ ФУНТИКА (чтобы не было "No data found")
+    await preload_candles_for_funtik(signal['symbol'], signal['direction'])
     
     # Add new signal
     queue.append({
@@ -217,6 +293,18 @@ async def monitor_log():
                 signal_lines_buffer = pending_signal_buffer
                 
                 for line in new_lines:
+                    # 🔥 FIX (28.09.2026): Парсим SIGNAL_FEATURES
+                    if 'SIGNAL_FEATURES' in line:
+                        try:
+                            # Извлекаем JSON из строки
+                            features_json = line.split('SIGNAL_FEATURES')[1].strip()
+                            features = json.loads(features_json)
+                            if signals_in_progress:
+                                signals_in_progress['features'] = features
+                                logger.debug(f"✅ Parsed features for {signals_in_progress.get('symbol', '?')}: {len(features)} keys")
+                        except Exception as e:
+                            logger.error(f"Failed to parse SIGNAL_FEATURES: {e}")
+                    
                     if 'SIGNAL_DECISION' in line:
                         # При появлении нового SIGNAL_DECISION обрабатываем предыдущий
                         # ЕСЛИ он достаточно старый (>=5 сек) - индикаторы уже записались

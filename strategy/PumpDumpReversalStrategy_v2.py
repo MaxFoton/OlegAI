@@ -113,6 +113,9 @@ def audit(event: str, pair: str = "", **fields) -> None:
 # ============================================================
 
 class Config:
+    # 🔥 TEMPORARY (03.10.2026): Отключить ВСЕ фильтры - доверяем анализатору
+    DISABLE_ALL_FILTERS = True  # Установить False чтобы включить обратно
+
     # Scanner
     #SIGNALS_PATH = Path(__file__).parent / "data" / "telegram_pump_signals.json"
     #DEX_SIGNALS_PATH = Path("/home/max/o_p/dex_scanner/data/dex_signals.json") # DEX сигналы (старое)
@@ -164,20 +167,20 @@ class Config:
     # New: TP1 1.5%, TP2 2.5% - proper R/R ratio, expect WR ~50%
     
     # REVERSAL: tight stops, fast TP (mean reversion plays)
-    REVERSAL_TP1 = 0.015  # +1.5% close 30% (was 0.51%, too tight)
+    REVERSAL_TP1 = 0.003  # +0.3% close 30% (FIX 25.09: было 0.5%, еще ближе)
     REVERSAL_TP1_RATIO = 0.30
-    REVERSAL_TP2 = 0.025  # +2.5% close 30% (was 1.25%)
+    REVERSAL_TP2 = 0.008  # +0.8% close 30% (FIX 25.09: было 1.0%)
     REVERSAL_TP2_RATIO = 0.30
-    REVERSAL_BE = 0.006  # breakeven move at +0.6%
+    REVERSAL_BE = 0.002  # breakeven move at +0.2%
     REVERSAL_FAST_FAIL_DUR = 15
     REVERSAL_FAST_FAIL_PNL = -0.020  # -2.0%
     
     # CONTINUATION: wider stops, larger targets
-    CONTINUATION_TP1 = 0.018  # +1.8% close 30%
+    CONTINUATION_TP1 = 0.003  # +0.3% close 30% (FIX 25.09: было 0.5%)
     CONTINUATION_TP1_RATIO = 0.30
-    CONTINUATION_TP2 = 0.030  # +3.0% close 30%
+    CONTINUATION_TP2 = 0.008  # +0.8% close 30% (FIX 25.09: было 1.0%)
     CONTINUATION_TP2_RATIO = 0.30
-    CONTINUATION_BE = 0.008   # breakeven at +0.8%
+    CONTINUATION_BE = 0.002   # breakeven at +0.2%
     CONTINUATION_FAST_FAIL_DUR = 12
     CONTINUATION_FAST_FAIL_PNL = -0.020  # -2.0%
     
@@ -258,7 +261,7 @@ class PumpDumpReversalStrategyV2(IStrategy):
     INTERFACE_VERSION = 3
     can_short = True
     timeframe = "5m"
-    startup_candle_count = 50  # Снижено со 100 для экономии RAM (01.09.2026)
+    startup_candle_count = 10  # 🔥 МИНИМУМ: свечи загружает scanner_log_monitor.py (05.10.2026)
     process_only_new_candles = False
     use_exit_signal = True
     position_adjustment_enable = True # Enable partial exits
@@ -266,6 +269,8 @@ class PumpDumpReversalStrategyV2(IStrategy):
     
     # REMOVED: Duplicate protections function - see actual one below (line ~297)
     
+    # 🔥 ВОССТАНОВЛЕНО (05.10.2026): Freqtrade нужен informative_pairs чтобы читать 1h
+    # Свечи 1h загружает scanner_log_monitor.py, Freqtrade только читает готовые файлы
     def informative_pairs(self):
         """Регистрируем 1h таймфрейм для всех пар whitelist —
         нужно для HTF-фильтра в populate_entry_trend (_check_htf_trend)."""
@@ -294,8 +299,11 @@ class PumpDumpReversalStrategyV2(IStrategy):
             #  "trade_limit": 3, "stop_duration_candles": 12},
             {"method": "LowProfitPairs", "lookback_period_candles": 48,
              "trade_limit": 4, "stop_duration_candles": 24, "required_profit": -0.02},
-            {"method": "MaxDrawdown", "lookback_period_candles": 96,
-             "trade_limit": 10, "stop_duration_candles": 48, "max_allowed_drawdown": 0.12},
+            # DISABLED 24.09.2026 16:50: MaxDrawdown блокировал ВСЕ сделки на 4 часа!
+            # Просадка 12.58% > 12% за 8 часов = глобальный lock до 14:15
+            # НАХЕР! Пусть торгует без этой хрени!
+            # {"method": "MaxDrawdown", "lookback_period_candles": 96,
+            #  "trade_limit": 10, "stop_duration_candles": 48, "max_allowed_drawdown": 0.12},
         ]
     
     def __init__(self, *args, **kwargs):
@@ -642,51 +650,239 @@ class PumpDumpReversalStrategyV2(IStrategy):
             # SHORT: блок если HTF < -3% (движение уже состоялось)
             # ═══════════════════════════════════════════════════════════════════
             if signal_source == "max-analysis":
+                # 🔥 FIX (29.09.2026): BTC trend filter - блокируем вход против глобального тренда
+                btc_1h = signal.get('features', {}).get('btc_1h', 0)
+                
+                # БЛОК SHORT если BTC резко вырос (альты следуют вверх)
+                if direction == "SHORT" and btc_1h > 2.5:
+                    audit("BLOCKED", pair, direction=direction, reason="btc_strong_up",
+                          btc_1h=f"{btc_1h:+.2f}%", source="max-analysis", score=scanner_score)
+                    logger.warning(
+                        f"🛑 MAX-ANALYSIS BTC FILTER {ticker} | SHORT но BTC={btc_1h:+.2f}% резко вырос | "
+                        f"Альты следуют за BTC вверх, SHORT рискованен!"
+                    )
+                    return df
+                
+                # БЛОК LONG если BTC резко упал (альты падают вместе)
+                if direction == "LONG" and btc_1h < -2.5:
+                    audit("BLOCKED", pair, direction=direction, reason="btc_strong_down",
+                          btc_1h=f"{btc_1h:+.2f}%", source="max-analysis", score=scanner_score)
+                    logger.warning(
+                        f"🛑 MAX-ANALYSIS BTC FILTER {ticker} | LONG но BTC={btc_1h:+.2f}% резко упал | "
+                        f"Альты падают вместе с BTC, LONG рискованен!"
+                    )
+                    return df
+                
                 # 🔥 FIX (24.09.2026 00:10): Снижен порог с 0.5 до 0.15 для LONG
                 # ПРОБЛЕМА: vol_spike считается из ТЕКУЩИХ данных Bybit, не из сканера!
                 #   KMNO показывает 0.16 (низкая активность СЕЙЧАС), но сигнал был на высоком объеме РАНЬШЕ
-                # РЕШЕНИЕ: Блокируем только СОВСЕМ мертвые монеты (vol < 0.15)
-                # SHORT: фильтр ОТКЛЮЧЕН полностью
-                if direction == "LONG" and vol_spike < 0.15:
-                    audit("BLOCKED", pair, direction=direction, reason="volume_too_low",
-                          vol_spike=f"{vol_spike:.2f}", source=signal_source, score=scanner_score)
-                    logger.warning(
-                        f"🛑 VOLUME FILTER BLOCK {ticker} | LONG | vol_spike={vol_spike:.2f}x < 0.15 | "
-                        f"Недостаточный объём для входа!"
-                    )
-                    return df
-                
+                # DISABLED (03.10.2026) - доверяем анализатору
+                #                 # РЕШЕНИЕ: Блокируем только СОВСЕМ мертвые монеты (vol < 0.15)
+                # DISABLED (03.10.2026) - доверяем анализатору
+                #                 # SHORT: фильтр ОТКЛЮЧЕН полностью
+                # DISABLED (03.10.2026) - доверяем анализатору
+                #                 if not Config.DISABLE_ALL_FILTERS and direction == "LONG" and vol_spike < 0.15:
+                # DISABLED (03.10.2026) - доверяем анализатору
+                #                     audit("BLOCKED", pair, direction=direction, reason="volume_too_low",
+                # DISABLED (03.10.2026) - доверяем анализатору
+                #                           vol_spike=f"{vol_spike:.2f}", source=signal_source, score=scanner_score)
+                # DISABLED (03.10.2026) - доверяем анализатору
+                #                     logger.warning(
+                # DISABLED (03.10.2026) - доверяем анализатору
+                #                         f"🛑 VOLUME FILTER BLOCK {ticker} | LONG | vol_spike={vol_spike:.2f}x < 0.15 | "
+                # DISABLED (03.10.2026) - доверяем анализатору
+                #                         f"Недостаточный объём для входа!"
+                # DISABLED (03.10.2026) - доверяем анализатору
+                #                     )
+                # DISABLED (03.10.2026) - доверяем анализатору
+                #                     return df
+                # DISABLED (03.10.2026) - доверяем анализатору
+                #                 
                 # Проверка "конца движения"
-                # 🔥 FIX (24.09.2026 00:15): Ослаблены пороги с ±2.3% до ±6%
-                # ПРИЧИНА: Слишком жесткие фильтры блокируют все max-analysis сигналы
-                # РЕШЕНИЕ: Блокируем только при ОЧЕНЬ сильном движении (>6%)
-                htf_trend_kiro = self._get_htf_trend_1h_pct(pair)
+                # 🔥 FIX (24.09.2026 16:20): Добавлена проверка НИЖНЕЙ границы для LONG!
+                # 🔥 FIX (29.09.2026): Берём htf_1h из features если есть, иначе вычисляем
+                htf_trend_kiro = signal.get('features', {}).get('htf_1h')
+                if htf_trend_kiro is None:
+                    htf_trend_kiro = self._get_htf_trend_1h_pct(pair)
                 
-                # LONG: блок если движение уже ушло вверх > +6%
-                if direction == "LONG" and htf_trend_kiro > 6.0:
-                    audit("BLOCKED", pair, direction=direction, reason="late_entry_long",
-                          htf_1h=f"{htf_trend_kiro:+.2f}%", source="max-analysis", score=scanner_score)
+                # 🔥 FIX (30.09.2026): Проверка краткосрочного momentum перед входом
+                # Блокируем вход если цена идёт против направления (d5_atr, delta_5m)
+                delta_5m = signal.get('features', {}).get('delta_5m', 0)
+                d5_atr = signal.get('features', {}).get('d5_atr', 0)
+                
+                # LONG: блок если 5m momentum отрицательный
+                if not Config.DISABLE_ALL_FILTERS and direction == "LONG" and delta_5m < -0.5:
+                    audit("BLOCKED", pair, direction=direction, reason="negative_5m_momentum",
+                          delta_5m=f"{delta_5m:+.2f}%", source="max-analysis", score=scanner_score)
                     logger.warning(
-                        f"🛑 MAX-ANALYSIS LATE ENTRY BLOCK {ticker} | LONG но htf_1h={htf_trend_kiro:+.2f}% > +6.0% | "
-                        f"Движение УЖЕ произошло! Не входим в продолжение резкого пампа!"
+                        f"🛑 MAX-ANALYSIS MOMENTUM BLOCK {ticker} | LONG но delta_5m={delta_5m:+.2f}% < -0.5% | "
+                        f"Цена падает за последние 5 минут!"
                     )
                     return df
+                
+                # SHORT: блок если 5m momentum положительный
+                if direction == "SHORT" and delta_5m > +0.5:
+                    audit("BLOCKED", pair, direction=direction, reason="positive_5m_momentum",
+                          delta_5m=f"{delta_5m:+.2f}%", source="max-analysis", score=scanner_score)
+                    logger.warning(
+                        f"🛑 MAX-ANALYSIS MOMENTUM BLOCK {ticker} | SHORT но delta_5m={delta_5m:+.2f}% > +0.5% | "
+                        f"Цена растёт за последние 5 минут!"
+                    )
+                    return df
+                
+                # DISABLED (05.10.2026): HTF блоки отключены для max-analysis
+
+                
+                # LONG: блок если движение вниз < -4.0% (против тренда)
+
+                
+                # if direction == "LONG" and htf_trend_kiro < -4.0:
+
+                
+                #     audit("BLOCKED", pair, direction=direction, reason="htf_against_long",
+
+                
+                #           htf_1h=f"{htf_trend_kiro:+.2f}%", source="max-analysis", score=scanner_score)
+
+                
+                #     logger.warning(
+
+                
+                #         f"🛑 MAX-ANALYSIS HTF BLOCK {ticker} | LONG но htf_1h={htf_trend_kiro:+.2f}% < -4.0% | "
+
+                
+                #         f"Движение ВНИЗ! Не входим в LONG против тренда!"
+
+                
+                #     )
+
+                
+                #     return df
+                
+                # DISABLED (05.10.2026): HTF блоки отключены для max-analysis
+
+                
+                # LONG: блок если движение уже ушло вверх > +5%
+
+                
+                # if direction == "LONG" and htf_trend_kiro > 5.0:
+
+                
+                #     audit("BLOCKED", pair, direction=direction, reason="late_entry_long",
+
+                
+                #           htf_1h=f"{htf_trend_kiro:+.2f}%", source="max-analysis", score=scanner_score)
+
+                
+                #     logger.warning(
+
+                
+                #         f"🛑 MAX-ANALYSIS LATE ENTRY BLOCK {ticker} | LONG но htf_1h={htf_trend_kiro:+.2f}% > +5.0% | "
+
+                
+                #         f"Движение УЖЕ произошло! Не входим в продолжение резкого пампа!"
+
+                
+                #     )
+
+                
+                #     return df
+                
+                # DISABLED (05.10.2026): HTF блоки отключены для max-analysis
+
+                
+                # SHORT: блок если движение вверх > +4.0% (против тренда)
+
+                
+                # if direction == "SHORT" and htf_trend_kiro > 4.0:
+
+                
+                #     audit("BLOCKED", pair, direction=direction, reason="htf_against_short",
+
+                
+                #           htf_1h=f"{htf_trend_kiro:+.2f}%", source="max-analysis", score=scanner_score)
+
+                
+                #     logger.warning(
+
+                
+                #         f"🛑 MAX-ANALYSIS HTF BLOCK {ticker} | SHORT но htf_1h={htf_trend_kiro:+.2f}% > +4.0% | "
+
+                
+                #         f"Движение ВВЕРХ! Не входим в SHORT против тренда!"
+
+                
+                #     )
+
+                
+                #     return df
+                
+                # DISABLED (05.10.2026): HTF блоки отключены для max-analysis
+
                 
                 # SHORT: блок если движение уже ушло вниз < -6%
-                if direction == "SHORT" and htf_trend_kiro < -6.0:
-                    audit("BLOCKED", pair, direction=direction, reason="late_entry_short",
-                          htf_1h=f"{htf_trend_kiro:+.2f}%", source="max-analysis", score=scanner_score)
+
+                
+                # if direction == "SHORT" and htf_trend_kiro < -6.0:
+
+                
+                #     audit("BLOCKED", pair, direction=direction, reason="late_entry_short",
+
+                
+                #           htf_1h=f"{htf_trend_kiro:+.2f}%", source="max-analysis", score=scanner_score)
+
+                
+                #     logger.warning(
+
+                
+                #         f"🛑 MAX-ANALYSIS LATE ENTRY BLOCK {ticker} | SHORT но htf_1h={htf_trend_kiro:+.2f}% < -6.0% | "
+
+                
+                #         f"Движение УЖЕ произошло! Не входим в продолжение дампа!"
+
+                
+                #     )
+
+                
+                #     return df
+                
+                # 🔥 КРИТИЧНЫЙ FIX (01.10.2026): ПРОВЕРКА VERDICT ПЕРЕД ВХОДОМ!
+                # ПРОБЛЕМА: 46 из 48 сделок (96%) шли через MAX-ANALYSIS без проверки verdict
+                # РЕЗУЛЬТАТ: WR=39.1%, PnL=-14.26% (-$179.83)
+                # ПРИЧИНА: Стратегия игнорировала результаты анализатора и входила ВСЕГДА
+                # РЕШЕНИЕ: Проверять verdict_machine - входить только если ENTRY/ВХОДИТЬ/ШОРТИТЬ
+                verdict_machine = signal.get('verdict_machine') or signal.get('verdict', '')
+                status = signal.get('status', '')
+                
+                # Список допустимых вердиктов
+                valid_verdicts = ["ENTRY", "✅ ВХОДИТЬ", "✅ ШОРТИТЬ", "ВХОДИТЬ", "ШОРТИТЬ"]
+                
+                if verdict_machine not in valid_verdicts:
+                    audit("BLOCKED", pair, direction=direction, reason="verdict_not_entry",
+                          verdict=verdict_machine, source="max-analysis", score=scanner_score)
                     logger.warning(
-                        f"🛑 MAX-ANALYSIS LATE ENTRY BLOCK {ticker} | SHORT но htf_1h={htf_trend_kiro:+.2f}% < -6.0% | "
-                        f"Движение УЖЕ произошло! Не входим в продолжение дампа!"
+                        f"🛑 MAX-ANALYSIS VERDICT BLOCK {ticker} | verdict={verdict_machine} (not ENTRY) | "
+                        f"Анализатор не одобрил вход!"
                     )
                     return df
                 
-                logger.info(f"✅ MAX-ANALYSIS ENTRY {ticker} | {direction} | score={scanner_score}/15 | htf_1h={htf_trend_kiro:+.2f}%")
+                # Проверка status (опционально, для дополнительной защиты)
+                # Пустой status допускается для обратной совместимости
+                if status and status not in ["approved", "confirmed"]:
+                    audit("BLOCKED", pair, direction=direction, reason="status_not_approved",
+                          status=status, verdict=verdict_machine, source="max-analysis", score=scanner_score)
+                    logger.warning(
+                        f"🛑 MAX-ANALYSIS STATUS BLOCK {ticker} | status={status} (not approved/confirmed) | "
+                        f"Сигнал не подтверждён!"
+                    )
+                    return df
+                
+                logger.info(f"✅ MAX-ANALYSIS ENTRY {ticker} | {direction} | verdict={verdict_machine} | score={scanner_score}/15 | htf_1h={htf_trend_kiro:+.2f}%")
                 
                 audit("ENTRY_SIGNAL", pair, direction=direction, mode="MAX_ANALYSIS",
                       source=signal_source, signal_type=signal_type, signal_ts=signal_ts,
-                      score=scanner_score, htf_1h=f"{htf_trend_kiro:+.2f}%")
+                      score=scanner_score, htf_1h=f"{htf_trend_kiro:+.2f}%",
+                      verdict=verdict_machine, status=status)
 
                 # Немедленный вход
                 if direction == "LONG":
@@ -743,6 +939,29 @@ class PumpDumpReversalStrategyV2(IStrategy):
             # НИКАКИХ дополнительных проверок - это лучшие моменты входа!
             # ═══════════════════════════════════════════════════════════════════
             if signal_source == "wait_queue":
+                # 🔥 FIX (29.09.2026): BTC trend filter для wait_queue
+                btc_1h = signal.get('features', {}).get('btc_1h', 0)
+                
+                # БЛОК SHORT если BTC резко вырос
+                if direction == "SHORT" and btc_1h > 2.5:
+                    audit("BLOCKED", pair, direction=direction, reason="btc_strong_up",
+                          btc_1h=f"{btc_1h:+.2f}%", source="wait_queue", score=scanner_score)
+                    logger.warning(
+                        f"🛑 WAIT_QUEUE BTC FILTER {ticker} | SHORT но BTC={btc_1h:+.2f}% резко вырос | "
+                        f"Альты следуют за BTC вверх, SHORT рискованен!"
+                    )
+                    return df
+                
+                # БЛОК LONG если BTC резко упал
+                if direction == "LONG" and btc_1h < -2.5:
+                    audit("BLOCKED", pair, direction=direction, reason="btc_strong_down",
+                          btc_1h=f"{btc_1h:+.2f}%", source="wait_queue", score=scanner_score)
+                    logger.warning(
+                        f"🛑 WAIT_QUEUE BTC FILTER {ticker} | LONG но BTC={btc_1h:+.2f}% резко упал | "
+                        f"Альты падают вместе с BTC, LONG рискованен!"
+                    )
+                    return df
+                
                 # 🔥 FIX (23.09.2026 вечер): Снижен порог с 1.0 до 0.5 для LONG
                 # ПРОБЛЕМА: Слишком много блокировок (vol 0.5-0.9), не хватает сделок
                 # РЕШЕНИЕ: Блокируем только совсем мусор (vol < 0.5)
@@ -757,18 +976,39 @@ class PumpDumpReversalStrategyV2(IStrategy):
                     return df
                 
                 # Проверка "конца движения" как у max-analysis
-                # 🔥 FIX (24.09.2026 00:15): Ослаблены пороги с ±2.3% до ±6%
-                # ПРИЧИНА: Слишком жесткие фильтры блокируют сигналы
-                # РЕШЕНИЕ: Блокируем только при ОЧЕНЬ сильном движении (>6%)
-                htf_trend_wait = self._get_htf_trend_1h_pct(pair)
+                # 🔥 FIX (24.09.2026 16:22): Добавлена проверка НИЖНЕЙ границы для LONG!
+                # 🔥 FIX (29.09.2026): Берём htf_1h из features если есть
+                htf_trend_wait = signal.get('features', {}).get('htf_1h')
+                if htf_trend_wait is None:
+                    htf_trend_wait = self._get_htf_trend_1h_pct(pair)
+                
+                # LONG: блок если движение вниз < -4.0% (против тренда)
+                if direction == "LONG" and htf_trend_wait < -4.0:
+                    audit("BLOCKED", pair, direction=direction, reason="htf_against_long",
+                          htf_1h=f"{htf_trend_wait:+.2f}%", source="wait_queue", score=scanner_score)
+                    logger.warning(
+                        f"🛑 WAIT_QUEUE HTF BLOCK {ticker} | LONG но htf_1h={htf_trend_wait:+.2f}% < -4.0% | "
+                        f"Движение ВНИЗ! Не входим в LONG против тренда!"
+                    )
+                    return df
                 
                 # LONG: блок если движение уже ушло вверх > +6%
-                if direction == "LONG" and htf_trend_wait > 6.0:
+                if direction == "LONG" and htf_trend_wait > 8.0:
                     audit("BLOCKED", pair, direction=direction, reason="late_entry_long",
                           htf_1h=f"{htf_trend_wait:+.2f}%", source="wait_queue", score=scanner_score)
                     logger.warning(
                         f"🛑 WAIT_QUEUE LATE ENTRY BLOCK {ticker} | LONG но htf_1h={htf_trend_wait:+.2f}% > +6.0% | "
                         f"Движение УЖЕ произошло! Не входим в продолжение резкого пампа!"
+                    )
+                    return df
+                
+                # SHORT: блок если движение вверх > +4.0% (против тренда)
+                if direction == "SHORT" and htf_trend_wait < -8.0:
+                    audit("BLOCKED", pair, direction=direction, reason="htf_against_short",
+                          htf_1h=f"{htf_trend_wait:+.2f}%", source="wait_queue", score=scanner_score)
+                    logger.warning(
+                        f"🛑 WAIT_QUEUE HTF BLOCK {ticker} | SHORT но htf_1h={htf_trend_wait:+.2f}% > +4.0% | "
+                        f"Движение ВВЕРХ! Не входим в SHORT против тренда!"
                     )
                     return df
                 
@@ -2023,13 +2263,105 @@ class PumpDumpReversalStrategyV2(IStrategy):
                            entry_tag: str, side: str, **kwargs) -> bool:
         """Save snapshot when trade is confirmed
         
+        FIX (28.09.2026): 🔥 SIGNAL CONTRACT VALIDATION 🔥
+        Проверяем корректность сигнала из dex_signals_analysis.json:
+        - verdict = "ENTRY" (одобрен анализатором)
+        - status in {approved, confirmed} (не expired/rejected)
+        - direction совпадает с side
+        - price deviation < max допустимого (защита от устаревшей цены)
+        
         FIX (31.07.2026): 🔥 HTF HARD FILTER BACKUP LAYER 🔥
         Защита от scanner bugs - если сканер пропустил сигнал против HTF тренда,
         стратегия заблокирует вход!
-        
-        Проблема: CTC LONG HTF=-4.34% прошёл сканер (ошибка импорта lightgbm) → убыток!
-        Решение: Двойная проверка HTF в стратегии как последняя линия защиты.
         """
+        # 🔥 SIGNAL CONTRACT VALIDATION (28.09.2026) 🔥
+        signal = self.data_engine.get_signal(pair)
+        
+        if not signal:
+            logger.warning(f"🛑 ENTRY BLOCK {pair}: no signal found in dex_signals_analysis.json")
+            return False
+        
+        # Проверка verdict
+        # 🔥 FIX (30.09.2026): Проверяем ОБА поля - verdict_machine И verdict (fallback на старый формат)
+        verdict_machine = signal.get("verdict_machine") or signal.get("verdict", "")
+        
+        # Список допустимых значений (новый и старый форматы)
+        valid_verdicts = ["ENTRY", "WAIT_CONFIRMED", "✅ ВХОДИТЬ", "✅ ШОРТИТЬ", "ВХОДИТЬ", "ШОРТИТЬ"]
+        
+        if verdict_machine not in valid_verdicts:
+            logger.warning(f"🛑 ENTRY BLOCK {pair}: verdict={verdict_machine} (not ENTRY)")
+            audit(
+                "BLOCK_VERDICT", pair, direction=side.upper(), entry_tag=entry_tag or "",
+                rate=f"{rate:.8f}", verdict=verdict_machine,
+                reason="Signal verdict is not ENTRY"
+            )
+            return False
+        
+        # 🔥 FIX (30.09.2026): Убрана проверка status - избыточна после проверки verdict
+        # Старые сигналы имеют status=null, data_engine фильтрует такие ключи
+        # Если verdict="ВХОДИТЬ"/"ENTRY" прошёл - значит сигнал валидный
+        
+        # 🔥 КРИТИЧНЫЙ FIX (01.10.2026): БЛОКИРОВАТЬ ВХОД ПО РОДИТЕЛЬСКОМУ WAIT!
+        # ПРОБЛЕМА: 2 сделки вошли после вердикта "ЖДАТЬ" (VET -1.03%)
+        # ПРИЧИНА: Родительский WAIT сигнал без child попадал в стратегию
+        # РЕШЕНИЕ: Проверяем parent_signal_id - если его нет и verdict был WAIT, это родитель
+        
+        # Проверяем source - если это wait_queue/wait_monitor
+        signal_source = signal.get("source", "")
+        parent_signal_id = signal.get("parent_signal_id")
+        
+        if signal_source in ["wait_queue", "wait_monitor"]:
+            if not parent_signal_id:
+                # Это потенциально родительский сигнал
+                # Проверяем не был ли оригинальный verdict = WAIT
+                original_verdict = signal.get("original_verdict") or signal.get("wait_verdict")
+                if original_verdict and "ЖДАТЬ" in original_verdict:
+                    logger.warning(
+                        f"🛑 ENTRY BLOCK {pair}: родительский WAIT сигнал без child | "
+                        f"original_verdict={original_verdict}"
+                    )
+                    audit(
+                        "BLOCK_WAIT_PARENT", pair, direction=side.upper(), entry_tag=entry_tag or "",
+                        rate=f"{rate:.8f}", original_verdict=original_verdict,
+                        reason="Parent WAIT signal without confirmed child"
+                    )
+                    return False
+        
+        # Проверка direction
+        signal_direction = signal.get("direction", "").upper()
+        expected_direction = side.upper()
+        if signal_direction != expected_direction:
+            logger.warning(
+                f"🛑 ENTRY BLOCK {pair}: direction mismatch signal={signal_direction} vs side={expected_direction}"
+            )
+            audit(
+                "BLOCK_DIRECTION", pair, direction=expected_direction, entry_tag=entry_tag or "",
+                rate=f"{rate:.8f}", signal_direction=signal_direction,
+                reason="Direction mismatch"
+            )
+            return False
+        
+        # Проверка price deviation
+        # 🔥 FIX (30.09.2026): Увеличен default порог с 0.5% до 2.0%
+        # Альткоины волатильны, 0.5% слишком жёстко (APT упал 1.52% за 30 сек)
+        entry_price = float(signal.get("entry_price", 0))
+        if entry_price > 0:
+            max_deviation = float(signal.get("max_entry_deviation_pct", 2.0))
+            deviation_pct = abs(rate - entry_price) / entry_price * 100.0
+            
+            if not Config.DISABLE_ALL_FILTERS and deviation_pct > max_deviation:
+                logger.warning(
+                    f"🛑 ENTRY BLOCK {pair}: price deviation {deviation_pct:.2f}% > {max_deviation}% "
+                    f"(expected={entry_price:.8f}, current={rate:.8f})"
+                )
+                audit(
+                    "BLOCK_PRICE_DEV", pair, direction=expected_direction, entry_tag=entry_tag or "",
+                    rate=f"{rate:.8f}", expected_price=f"{entry_price:.8f}",
+                    deviation_pct=f"{deviation_pct:.2f}%", max_dev=f"{max_deviation}%",
+                    reason="Price deviation too large"
+                )
+                return False
+        
         scores = self._current_scores.get(pair, {})
         
         # 🔥 HTF HARD FILTER BACKUP (31.07.2026) 🔥
@@ -2060,9 +2392,39 @@ class PumpDumpReversalStrategyV2(IStrategy):
             logger.warning(f"🛑 HTF FILTER BLOCK: {pair} SHORT против HTF={htf_1h:.2f}% (bullish)")
             return False
         
+        # 🔥 FIX (01.10.2026): РАСШИРЕННЫЙ AUDIT ДЛЯ ТРЕЙСИНГА
+        # Добавляем поля для анализа источника сигнала и времени задержки
+        signal_timestamp_str = signal.get("signal_timestamp") or signal.get("timestamp")
+        signal_timestamp = None
+        entry_delay_sec = None
+        
+        if signal_timestamp_str:
+            try:
+                # Парсим timestamp (может быть в разных форматах)
+                from datetime import datetime
+                if 'T' in signal_timestamp_str:
+                    # ISO format
+                    signal_timestamp = datetime.fromisoformat(signal_timestamp_str.replace('Z', '+00:00'))
+                else:
+                    # Обычный формат
+                    signal_timestamp = datetime.strptime(signal_timestamp_str[:19], '%Y-%m-%d %H:%M:%S')
+                
+                # Вычисляем задержку входа
+                entry_delay_sec = int((current_time - signal_timestamp).total_seconds())
+            except:
+                pass
+        
         audit(
             "ENTRY", pair, direction=direction, entry_tag=entry_tag or "",
             rate=f"{rate:.8f}", signal_ts=scores.get("signal_ts", "?"),
+            # 🔥 Новые поля для анализа:
+            signal_id=signal.get("signal_id", "?"),
+            parent_signal_id=signal.get("parent_signal_id", "?"),
+            source=signal.get("source", "?"),
+            verdict=verdict_machine,
+            status=signal.get("status", "?"),
+            model_prob=signal.get("confidence", "?"),
+            entry_delay_sec=entry_delay_sec,
         )
         if not scores:
             return True
@@ -2395,58 +2757,18 @@ class PumpDumpReversalStrategyV2(IStrategy):
             )
             return hard_stop
         # ═══════════════════════════════════════════════════════════════════
-        # ГЛАВНОЕ ИЗМЕНЕНИЕ (07.07.2026): NO TRAILING BEFORE TP1
+        # FIX 26.09.2026: ОТКЛЮЧЁН AGGRESSIVE TRAILING ДО TP1!
+        # ПРОБЛЕМА: trailing_stop_loss срабатывал на +0.5-1.0% ДО TP1 (+0.3%)
+        # Примеры: BEAM +0.04%, PENGU +0.13%, RARE +0.61%, Z +0.12% - ВСЕ trailing_stop_loss
+        # РЕШЕНИЕ: НЕТ TRAILING ДО TP1 - только hard stoploss
+        # После TP1 → adjust_trade_position закроет 30% → ПОТОМ включится trailing
         # ═══════════════════════════════════════════════════════════════════
         
-        # ФАЗА 1: Profit < TP1 — АГРЕССИВНЫЙ ТРЕЙЛИНГ (23.07.2026)
-        # ПРОБЛЕМА: MFE analysis показывает что сделки доходят до +1.5-3%, но
-        # trailing отдаёт прибыль. STG: MFE +1.77%, закрыто -1.07% (слито 2.8%!).
-        # РЕШЕНИЕ: Агрессивный трейлинг для малых профитов:
-        # +0.5% → SL на breakeven
-        # +0.8% → SL на +0.3% (фиксируем что-то)
-        # +1.0% → SL на +0.5%
-        # TP1 → MFE trail (старая логика)
+        # ФАЗА 1: Profit < TP1 — НЕТ TRAILING, ТОЛЬКО HARD STOPLOSS
         if current_profit < tp1_target:
-            if current_profit >= 0.010:  # +1.0%
-                lock_profit = 0.005  # SL на +0.5%
-                distance = max(current_profit - lock_profit, 0.001)
-                logger.debug(
-                    f" AGGRESSIVE TRAIL {pair} | profit={current_profit:.2%} | "
-                    f"lock={lock_profit:.2%} | mode={setup_mode}"
-                )
-                return distance
-            elif current_profit >= 0.008:  # +0.8%
-                lock_profit = 0.003  # SL на +0.3%
-                distance = max(current_profit - lock_profit, 0.001)
-                logger.debug(
-                    f" AGGRESSIVE TRAIL {pair} | profit={current_profit:.2%} | "
-                    f"lock={lock_profit:.2%} | mode={setup_mode}"
-                )
-                return distance
-            elif current_profit >= 0.005:  # +0.5%
-                # Breakeven
-                distance = max(current_profit - 0.001, 0.001)
-                logger.debug(
-                    f" AGGRESSIVE TRAIL {pair} | profit={current_profit:.2%} | "
-                    f"lock=breakeven | mode={setup_mode}"
-                )
-                return distance
-            elif current_profit >= be_trigger:
-                # Старая логика MFE trail
-                mfe = getattr(trade, "max_profit_seen", current_profit)
-                lock_buffer = 0.006
-                target_lock_profit = max(mfe - lock_buffer, 0.002)
-                distance = max(current_profit - target_lock_profit, 0.001)
-                logger.debug(
-                    f" MFE TRAIL {pair} | profit={current_profit:.2%} | MFE={mfe:.2%} | "
-                    f"mode={setup_mode} | lock_target={target_lock_profit:.2%}"
-                )
-                return distance
-            
-            # До breakeven - только hard stoploss
             logger.debug(
                 f" NO TRAILING {pair} | profit={current_profit:.2%} < TP1 {tp1_target:.2%} | "
-                f"using hard stoploss only"
+                f"waiting for partial TP1 exit | using hard stoploss only"
             )
             return None
         
@@ -2507,27 +2829,22 @@ class PumpDumpReversalStrategyV2(IStrategy):
                               current_entry_profit: float, current_exit_profit: float,
                               **kwargs) -> Optional[float]:
         """
-        TWO-STAGE PARTIAL TP (NEW 06.07.2026):
+        TWO-STAGE PARTIAL TP (NEW 06.07.2026, UPDATED 25.09.2026):
         
-        Цель: Держать позицию дольше, ловить большие движения
+        Цель: Фиксировать прибыль раньше, защищать капитал
         
         Логика:
-          TP1: Закрыть 30% при достижении первой цели
-          TP2: Закрыть ещё 30% при достижении второй цели
-          Runner: Остаток 40% идёт дальше с плотным trailing
+          TP1: Закрыть 30% при достижении первой цели (+0.5%)
+          TP2: Закрыть ещё 30% при достижении второй цели (+1.0%)
+          Runner: Остаток 40% идёт дальше с плотным trailing (+1.5%+)
         
-        REVERSAL:
-          TP1: 30% @ +1.5%
-          TP2: 30% @ +2.5%
-          Runner: 40% может словить +3-5%
+        REVERSAL & CONTINUATION (одинаковые уровни):
+          TP1: 30% @ +0.5% (быстрая фиксация)
+          TP2: 30% @ +1.0% (средний уровень)
+          Runner: 40% может словить +1.5-3%
         
-        CONTINUATION:
-          TP1: 30% @ +1.8%
-          TP2: 30% @ +3.0%
-          Runner: 40% может словить +4-8%
-        
-        Было: 50% @ +1.0%/+1.2%
-        Стало: 30% + 30% + 40% runner
+        FIX 25.09.2026: Снижены с +1.5%/+2.5% до +0.5%/+1.0%
+        Причина: Старые уровни слишком далеко, сделки не доходят
         """
         scores = self._current_scores.get(trade.pair, {})
         setup_mode = scores.get('setup_mode')
@@ -2552,12 +2869,15 @@ class PumpDumpReversalStrategyV2(IStrategy):
         
         # TP1: Первое частичное закрытие (30% от начальной позиции)
         if exits_done == 0 and current_profit >= tp1_target:
-            # Используем текущий stake_amount (который = начальному на первом exit)
+            # 🔥 FIX (28.09.2026): НЕ устанавливаем tp1_executed здесь!
+            # Это место только ВОЗВРАЩАЕТ запрос на частичный выход.
+            # Факт TP1 будет записан в order_filled() callback после фактического исполнения.
+            
             stake_to_close = trade.stake_amount * tp1_ratio
             logger.info(
-                f"📊 PARTIAL TP1 {trade.pair} | mode={setup_mode} | "
+                f"📊 PARTIAL TP1 REQUEST {trade.pair} | mode={setup_mode} | "
                 f"profit={current_profit:.2%} | target={tp1_target:.1%} | "
-                f"closing {tp1_ratio:.0%} of initial = {stake_to_close:.2f} USDT"
+                f"requesting close {tp1_ratio:.0%} of initial = {stake_to_close:.2f} USDT"
             )
             return -stake_to_close
         
@@ -2580,15 +2900,119 @@ class PumpDumpReversalStrategyV2(IStrategy):
         # Runner (40%) продолжает с плотным trailing из custom_stoploss
         return None
     
+    def order_filled(self, pair: str, trade, order, current_time, **kwargs) -> None:
+        """
+        Callback вызывается после ФАКТИЧЕСКОГО исполнения ордера.
+        Здесь записываем TP state в trade.custom_data.
+        
+        🔥 FIX (28.09.2026): TP state устанавливается ТОЛЬКО после fill, не в adjust_trade_position
+        """
+        # Проверяем что это частичный выход (не вход и не полное закрытие)
+        if order['ft_order_side'] != 'sell' and order['ft_order_side'] != 'buy':
+            # Это выходной ордер
+            if order.get('status') == 'closed' and order.get('filled', 0) > 0:
+                # Определяем какой TP это был
+                exits_done = trade.nr_of_successful_exits
+                
+                # Получаем setup mode
+                tag = (trade.enter_tag or "").lower()
+                setup_mode = "REVERSAL" if "reversal" in tag else "CONTINUATION"
+                
+                if setup_mode == 'REVERSAL':
+                    tp1_ratio = Config.REVERSAL_TP1_RATIO
+                    tp2_ratio = Config.REVERSAL_TP2_RATIO
+                else:
+                    tp1_ratio = Config.CONTINUATION_TP1_RATIO
+                    tp2_ratio = Config.CONTINUATION_TP2_RATIO
+                
+                # Инициализируем custom_data если нужно
+                # 🔥 FIX (28.09.2026): Используем getattr для безопасного доступа с lazy='raise'
+                try:
+                    custom_data = trade.custom_data if trade.custom_data is not None else {}
+                except:
+                    custom_data = {}
+                    
+                if not custom_data:
+                    custom_data = {}
+                
+                # TP1 исполнен
+                if exits_done == 1 and not custom_data.get('tp1_executed'):
+                    current_profit = trade.calc_profit_ratio(order['average'])
+                    custom_data['tp1_executed'] = True
+                    custom_data['tp1_profit'] = current_profit
+                    custom_data['tp1_ratio'] = tp1_ratio
+                    custom_data['tp1_timestamp'] = current_time.isoformat()
+                    # Инициализируем runner_peak текущим profit
+                    custom_data['runner_peak_profit'] = current_profit
+                    
+                    # Записываем обратно
+                    trade.custom_data = custom_data
+                    
+                    logger.info(
+                        f"✅ TP1 FILLED {pair} | profit={current_profit:.2%} | "
+                        f"closed {tp1_ratio:.0%} | runner_peak initialized={current_profit:.2%}"
+                    )
+                
+                # TP2 исполнен
+                elif exits_done == 2 and not custom_data.get('tp2_executed'):
+                    current_profit = trade.calc_profit_ratio(order['average'])
+                    custom_data['tp2_executed'] = True
+                    custom_data['tp2_profit'] = current_profit
+                    custom_data['tp2_ratio'] = tp2_ratio
+                    custom_data['tp2_timestamp'] = current_time.isoformat()
+                    
+                    # Записываем обратно
+                    trade.custom_data = custom_data
+                    
+                    logger.info(
+                        f"✅ TP2 FILLED {pair} | profit={current_profit:.2%} | "
+                        f"closed {tp2_ratio:.0%} | runner continues"
+                    )
+    
+    def _save_and_exit(self, pair: str, trade, current_time, current_profit: float, exit_reason: str) -> str:
+        """
+        🔥 FIX (28.09.2026): Helper для сохранения результата перед выходом
+        
+        Вызывается перед каждым exit из custom_exit() чтобы сохранить
+        результат сделки в trade_snapshots.db для обучения модели.
+        """
+        try:
+            # Определяем result на основе profit
+            if current_profit > 0.003:  # > 0.3%
+                result = "win"
+            elif current_profit > -0.002:  # между -0.2% и +0.3%
+                result = "breakeven"
+            else:  # < -0.2%
+                result = "loss"
+            
+            self.save_trade_result(
+                pair=pair,
+                trade_id=str(trade.id),
+                max_profit=trade.calc_profit_ratio(trade.max_rate) if trade.max_rate else current_profit,
+                max_drawdown=trade.calc_profit_ratio(trade.min_rate) if trade.min_rate else current_profit,
+                hold_time=int((current_time - trade.open_date_utc).total_seconds() / 60),
+                pnl_ratio=current_profit,
+                result=result,
+                current_time=current_time
+            )
+        except Exception as e:
+            logger.error(f"Failed to save trade result for {pair}: {e}")
+        
+        return exit_reason
+    
     def custom_exit(self, pair: str, trade, current_time, current_rate: float,
                    current_profit: float, **kwargs) -> Optional[str]:
-        """Exit logic via RiskEngine"""
+        """
+        Exit logic via RiskEngine
+        
+        🔥 FIX (28.09.2026): Все exits сохраняют результат через _save_and_exit()
+        """
         if current_profit <= Config.HARD_STOPLOSS:
             logger.warning(
                 f"🚨 HARD STOP EXIT {pair} | pnl={current_profit:.2%} | "
                 f"limit={Config.HARD_STOPLOSS:.2%}"
             )
-            return "hard_stoploss_emergency"
+            return self._save_and_exit(pair, trade, current_time, current_profit, "hard_stoploss_emergency")
 
         df, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
         
@@ -2625,14 +3049,14 @@ class PumpDumpReversalStrategyV2(IStrategy):
                     f"🚨 SPIKE EXIT {pair} | LONG но RED свеча {current_candle_size:.1%} | "
                     f"vol×{volume_spike_current:.1f} | EMERGENCY!"
                 )
-                return "spike_candle_emergency"
+                return self._save_and_exit(pair, trade, current_time, current_profit, "spike_candle_emergency")
             # Предыдущая свеча spike (реагируем быстрее!)
             if prev_candle_direction < 0 and prev_candle_size > 0.05 and volume_spike_prev > 1.5:
                 logger.warning(
                     f"🚨 SPIKE EXIT {pair} | LONG но PREV RED свеча {prev_candle_size:.1%} | "
                     f"vol×{volume_spike_prev:.1f} | EMERGENCY!"
                 )
-                return "spike_candle_emergency"
+                return self._save_and_exit(pair, trade, current_time, current_profit, "spike_candle_emergency")
         
         # SHORT в сделке, но ОГРОМНАЯ зелёная свеча (>4%) с объёмом
         if not is_long:
@@ -2642,14 +3066,49 @@ class PumpDumpReversalStrategyV2(IStrategy):
                     f"🚨 SPIKE EXIT {pair} | SHORT но GREEN свеча {current_candle_size:.1%} | "
                     f"vol×{volume_spike_current:.1f} | EMERGENCY!"
                 )
-                return "spike_candle_emergency"
+                return self._save_and_exit(pair, trade, current_time, current_profit, "spike_candle_emergency")
             # Предыдущая свеча spike (реагируем быстрее!)
             if prev_candle_direction > 0 and prev_candle_size > 0.05 and volume_spike_prev > 1.5:
                 logger.warning(
                     f"🚨 SPIKE EXIT {pair} | SHORT но PREV GREEN свеча {prev_candle_size:.1%} | "
                     f"vol×{volume_spike_prev:.1f} | EMERGENCY!"
                 )
-                return "spike_candle_emergency"
+                return self._save_and_exit(pair, trade, current_time, current_profit, "spike_candle_emergency")
+        
+        # ═══════════════════════════════════════════════════════════════════
+        # RUNNER PROTECTION (FIXED 28.09.2026)
+        # Защита: Если runner откатился НИЖЕ 50% от своего пика - закрываем
+        # ═══════════════════════════════════════════════════════════════════
+        
+        # Проверяем наличие данных о TP в custom_data
+        # 🔥 FIX (28.09.2026): Безопасный доступ к custom_data с lazy='raise'
+        try:
+            custom_data = trade.custom_data if trade.custom_data is not None else {}
+        except:
+            custom_data = {}
+            
+        if custom_data:
+            tp1_executed = custom_data.get('tp1_executed', False)
+            
+            if tp1_executed:
+                # Отслеживаем пиковый profit runner после TP1
+                runner_peak = custom_data.get('runner_peak_profit', 0)
+                
+                # Обновляем пик если текущий выше
+                if current_profit > runner_peak:
+                    custom_data['runner_peak_profit'] = current_profit
+                    trade.custom_data = custom_data  # Записываем обратно
+                    runner_peak = current_profit
+                    logger.debug(f"🏔️ {pair} runner peak updated: {runner_peak:.2%}")
+                
+                # ЗАЩИТА: Если откатились ниже 50% от пика - выходим
+                if runner_peak > 0 and current_profit < runner_peak * 0.5:
+                    logger.warning(
+                        f"🛑 RUNNER PROTECTION EXIT {pair} | "
+                        f"peak={runner_peak:.2%} | current={current_profit:.2%} | "
+                        f"потеря={(runner_peak - current_profit):.2%} (>{runner_peak*0.5:.2%} порог)"
+                    )
+                    return self._save_and_exit(pair, trade, current_time, current_profit, "runner_protection_exit")
         
         # ═══════════════════════════════════════════════════════════════════
         # MIN HOLD удален (10.06.2026)
@@ -2788,7 +3247,7 @@ class PumpDumpReversalStrategyV2(IStrategy):
                     f"🎯 RUNNER HARD TP MAX {pair} | profit={current_profit:.2%} >= {RUNNER_HARD_TP_MAX:.1%} | "
                     f"exits={trade.nr_of_successful_exits} | ЗАКРЫВАЕМ ПОЛНОСТЬЮ"
                 )
-                return "runner_hard_tp_max"
+                return self._save_and_exit(pair, trade, current_time, current_profit, "runner_hard_tp_max")
             elif current_profit >= RUNNER_HARD_TP_MIN:
                 # От +5% до +8% - проверяем признаки разворота
                 momentum = last["momentum"]
@@ -2802,14 +3261,14 @@ class PumpDumpReversalStrategyV2(IStrategy):
                         f"🎯 RUNNER HARD TP {pair} | profit={current_profit:.2%} | "
                         f"mom={momentum:.2f} vel={velocity:.2f} | разворот, ЗАКРЫВАЕМ"
                     )
-                    return "runner_hard_tp_reversal"
+                    return self._save_and_exit(pair, trade, current_time, current_profit, "runner_hard_tp_reversal")
         elif trade.nr_of_successful_exits >= 1 and current_profit >= 0.10:
             # Был только TP1, но профит уже +10% - закрываем полностью
             logger.info(
                 f"🎯 MEGA PROFIT EXIT {pair} | profit={current_profit:.2%} >= +10% | "
                 f"exits={trade.nr_of_successful_exits} | ЗАКРЫВАЕМ ВСЁ"
             )
-            return "mega_profit_exit"
+            return self._save_and_exit(pair, trade, current_time, current_profit, "mega_profit_exit")
         
         # Take profits - ОТКЛЮЧЕНО (21.09.2026)
         # ПРОБЛЕМА: custom_exit() вызывается РАНЬШЕ adjust_trade_position()
@@ -2878,7 +3337,7 @@ class PumpDumpReversalStrategyV2(IStrategy):
                         f" STRONG REVERSAL {pair} | mom={momentum:.2f} vel={velocity:.2f} | "
                         f"profit={current_profit:.2%} soft exit"
                     )
-                    return "long_soft_exit"
+                    return self._save_and_exit(pair, trade, current_time, current_profit, "long_soft_exit")
                 else:
                     logger.info(
                         f" WEAK SIGNAL {pair} | mom={momentum:.2f} vel={velocity:.2f} | "
@@ -2896,7 +3355,7 @@ class PumpDumpReversalStrategyV2(IStrategy):
                         f" STRONG REVERSAL {pair} | mom={momentum:.2f} vel={velocity:.2f} | "
                         f"profit={current_profit:.2%} soft exit"
                     )
-                    return "short_soft_exit"
+                    return self._save_and_exit(pair, trade, current_time, current_profit, "short_soft_exit")
                 else:
                     logger.info(
                         f" WEAK SIGNAL {pair} | mom={momentum:.2f} vel={velocity:.2f} | "
@@ -2915,7 +3374,7 @@ class PumpDumpReversalStrategyV2(IStrategy):
                     f" FAST FAIL {pair} | mode={setup_mode} | "
                     f"{trade_duration:.0f}min | pnl={current_profit:.2%}"
                 )
-                return f"fast_fail_{setup_mode.lower()}"
+                return self._save_and_exit(pair, trade, current_time, current_profit, f"fast_fail_{setup_mode.lower()}")
         
         # Early reversal exit (small profit + reversal signs)
         if current_profit > 0.003:
@@ -2923,9 +3382,9 @@ class PumpDumpReversalStrategyV2(IStrategy):
             rsi = last["rsi"]
             
             if is_long and momentum < -0.8 and rsi < 40:
-                return "long_reversal"
+                return self._save_and_exit(pair, trade, current_time, current_profit, "long_reversal")
             elif not is_long and momentum > 0.8 and rsi > 60:
-                return "short_reversal"
+                return self._save_and_exit(pair, trade, current_time, current_profit, "short_reversal")
         
         return None
 

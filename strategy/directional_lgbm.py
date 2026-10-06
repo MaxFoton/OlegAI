@@ -328,7 +328,94 @@ def predict_direction(signal: dict[str, Any], kind: str) -> tuple[str | None, fl
         probability = float(model.predict_proba(pd.DataFrame([extract_features(signal, kind)], columns=FEATURE_NAMES))[0, 1])
         direction = "LONG" if probability >= 0.5 else "SHORT"
         confidence = max(probability, 1 - probability)
+
+        # FIX (05.10.2026): Применяем RSI contratrend фильтры
+        features_dict = extract_features(signal, kind)
+        confidence = apply_rsi_contratrend_filter(signal, direction, confidence, features_dict)
         return direction, confidence
     except Exception as exc:
         logger.warning("directional model prediction failed: %s", exc)
         return None, 0.0
+
+
+def apply_rsi_contratrend_filter(
+    signal: dict,
+    direction: str,
+    confidence: float,
+    features: dict
+) -> float:
+    """Применяет RSI contratrend фильтры для снижения confidence в risky зонах.
+    
+    FIX (05.10.2026): КОМБО подход для RSI экстремумов
+    - Hard filter: RSI <25 для SHORT, >75 для LONG → confidence = 0.35
+    - Soft filter: RSI [25,30) для SHORT, (70,75] для LONG → штраф 10-15%
+    - Exhaustion exception: ers≥0.52 + EXHAUSTION + vol≥3.0 → без штрафов
+    
+    Returns: adjusted confidence (0-1)
+    """
+    # Извлекаем RSI контекст
+    rsi = _number(signal.get('rsi'), 50.0)
+    phase = str(signal.get('phase', '')).upper()
+    vol_ratio = _number(signal.get('vol_ratio'), 1.0)
+    exhaustion_reversal_strength = features.get('exhaustion_reversal_strength', 0.0)
+    
+    # Проверяем valid exhaustion reversal setup
+    is_valid_exhaustion = (
+        exhaustion_reversal_strength >= 0.52 and
+        phase == "EXHAUSTION" and
+        vol_ratio >= 3.0
+    )
+    
+    if is_valid_exhaustion:
+        # Exhaustion exception — ПОВЫШАЕМ confidence для сильных exhaustion reversals
+        # FIX (05.10.2026 v2): Усиленный boost для прохождения порога 0.60
+        # Используем max() чтобы гарантировать минимум 0.65 для валидных exhaustion
+        boost = min((exhaustion_reversal_strength - 0.5) * 0.25, 0.35)
+        boosted_confidence = max(min(confidence + boost, 0.99), 0.65)
+        logger.info(
+            f"RSI exhaustion BOOST: {direction} RSI={rsi:.1f} "
+            f"ers={exhaustion_reversal_strength:.2f} phase={phase} vol={vol_ratio:.1f}× "
+            f"confidence: {confidence:.2f} → {boosted_confidence:.2f} (boost=+{boost:.2f})"
+        )
+        return boosted_confidence
+    
+    # Hard filter: RSI <25 для SHORT, >75 для LONG
+    if direction == "SHORT" and rsi < 25:
+        logger.info(
+            f"RSI hard filter: SHORT RSI={rsi:.1f} <25 extreme oversold "
+            f"confidence: {confidence:.2f} → 0.35 (BLOCKED)"
+        )
+        return 0.35
+    
+    if direction == "LONG" and rsi > 75:
+        logger.info(
+            f"RSI hard filter: LONG RSI={rsi:.1f} >75 extreme overbought "
+            f"confidence: {confidence:.2f} → 0.35 (BLOCKED)"
+        )
+        return 0.35
+    
+    # Soft filter: RSI [25,30) для SHORT, (70,75] для LONG
+    penalty = 0.0
+    
+    if direction == "SHORT" and 25 <= rsi < 30:
+        # Пограничная зона: штраф от 10% (RSI=29.9) до 15% (RSI=25)
+        penalty = 0.10 + (30 - rsi) / 5.0 * 0.05
+        adjusted_confidence = max(confidence - penalty, 0.0)
+        logger.info(
+            f"RSI soft filter: SHORT RSI={rsi:.1f} borderline oversold "
+            f"confidence: {confidence:.2f} → {adjusted_confidence:.2f} (penalty={penalty:.2f})"
+        )
+        return adjusted_confidence
+    
+    if direction == "LONG" and 70 < rsi <= 75:
+        # Пограничная зона: штраф от 10% (RSI=70.1) до 15% (RSI=75)
+        penalty = 0.10 + (rsi - 70) / 5.0 * 0.05
+        adjusted_confidence = max(confidence - penalty, 0.0)
+        logger.info(
+            f"RSI soft filter: LONG RSI={rsi:.1f} borderline overbought "
+            f"confidence: {confidence:.2f} → {adjusted_confidence:.2f} (penalty={penalty:.2f})"
+        )
+        return adjusted_confidence
+    
+    # Нормальная зона — без изменений
+    return confidence

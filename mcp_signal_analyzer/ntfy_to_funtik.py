@@ -28,6 +28,78 @@ logging.basicConfig(
 logger = logging.getLogger("ntfy-to-funtik")
 
 
+def parse_wait_conditions(recommendations: list, direction: str) -> list:
+    """
+    Парсит текстовые рекомендации в структурированные conditions для wait_queue
+    
+    Примеры:
+    - "⏳ Ждать: RSI упадёт <50" -> {"type": "rsi_below", "threshold": 50}
+    - "1️⃣ MACD развернётся на bullish" -> {"type": "indicator_match", "indicator": "vw_macd", "value": "bullish"}
+    """
+    conditions = []
+    
+    for rec in recommendations:
+        rec_lower = rec.lower()
+        
+        # RSI условия
+        if 'rsi' in rec_lower:
+            import re
+            # RSI < X или RSI упадёт < X
+            match = re.search(r'rsi.*?[<≤].*?(\d+)', rec_lower)
+            if match:
+                threshold = int(match.group(1))
+                conditions.append({"type": "rsi_below", "threshold": threshold})
+                continue
+            
+            # RSI > X или RSI поднимется > X
+            match = re.search(r'rsi.*?[>≥].*?(\d+)', rec_lower)
+            if match:
+                threshold = int(match.group(1))
+                conditions.append({"type": "rsi_above", "threshold": threshold})
+                continue
+        
+        # MACD условия
+        if 'macd' in rec_lower:
+            if 'bullish' in rec_lower and direction == 'LONG':
+                conditions.append({"type": "indicator_match", "indicator": "vw_macd", "value": "bullish"})
+            elif 'bearish' in rec_lower and direction == 'SHORT':
+                conditions.append({"type": "indicator_match", "indicator": "vw_macd", "value": "bearish"})
+        
+        # Lorentzian условия
+        if 'lorentzian' in rec_lower or 'lor' in rec_lower:
+            if direction == 'LONG' and ('+1' in rec or '+3' in rec):
+                conditions.append({"type": "indicator_match", "indicator": "lorentzian", "value": "+1"})
+            elif direction == 'SHORT' and ('-1' in rec or '-3' in rec):
+                conditions.append({"type": "indicator_match", "indicator": "lorentzian", "value": "-1"})
+        
+        # Volume spike условия
+        if 'volume' in rec_lower and 'spike' in rec_lower:
+            import re
+            match = re.search(r'>.*?(\d+\.?\d*)', rec_lower)
+            if match:
+                threshold = float(match.group(1))
+                conditions.append({"type": "volume_spike_above", "threshold": threshold})
+        
+        # Свеча bullish/bearish
+        if direction == 'LONG' and 'bullish' in rec_lower and 'свеч' in rec_lower:
+            conditions.append({"type": "candle_bullish"})
+        elif direction == 'SHORT' and 'bearish' in rec_lower and 'свеч' in rec_lower:
+            conditions.append({"type": "candle_bearish"})
+        
+        # "RSI начнёт расти" или "RSI растёт"
+        if 'rsi' in rec_lower and ('начнёт расти' in rec_lower or 'растёт' in rec_lower or 'рост' in rec_lower):
+            conditions.append({"type": "rsi_rising"})
+        
+        # "Все индикаторы bullish" или "все индикаторы ЗА"
+        if 'все индикаторы' in rec_lower and ('bullish' in rec_lower or 'за' in rec_lower):
+            if direction == 'LONG':
+                conditions.append({"type": "all_indicators_bullish"})
+            elif direction == 'SHORT':
+                conditions.append({"type": "all_indicators_bearish"})
+    
+    return conditions
+
+
 def parse_ntfy_message(message: str, title: str) -> dict:
     """
     Парсит сообщение из ntfy и извлекает данные сигнала
@@ -39,7 +111,49 @@ def parse_ntfy_message(message: str, title: str) -> dict:
         ...
     """
     # Парсим title
-    # Формат: "📊 SYMBOL DIRECTION | VERDICT" или "📊 SYMBOL DIRECTION | VERDICT (confidence/10)"
+    # Формат 1: "📊 SYMBOL DIRECTION | VERDICT" или "📊 SYMBOL DIRECTION | VERDICT (confidence/10)"
+    # Формат 2: "✅ SYMBOL DIRECTION | WAIT CONFIRMED" (подтверждение из wait_queue)
+    
+    # Пробуем формат WAIT CONFIRMED
+    wait_confirmed_match = re.search(r'✅\s+(\w+)\s+(LONG|SHORT)\s+\|\s+WAIT\s+CONFIRMED', title)
+    if wait_confirmed_match:
+        symbol = wait_confirmed_match.group(1)
+        direction = wait_confirmed_match.group(2)
+        
+        # Парсим entry price и confidence из message
+        price_match = re.search(r'💰 Entry:\s*\$([0-9.]+)', message)
+        confidence_match = re.search(r'📊 Confidence:\s*([0-9]+)/10', message)
+        score_match = re.search(r'📈 Score:\s*([0-9]+)/15', message)
+        
+        if not price_match:
+            logger.warning(f"Could not parse entry price from WAIT CONFIRMED: {message[:100]}")
+            return None
+        
+        price = float(price_match.group(1))
+        confidence = int(confidence_match.group(1)) if confidence_match else 7
+        score = int(score_match.group(1)) if score_match else 0
+        
+        # WAIT CONFIRMED всегда идет на исполнение
+        signal = {
+            "coin": symbol,
+            "pair": f"{symbol}/USDT:USDT",
+            "direction": direction,
+            "kind": "analyzed",
+            "signal_type": "wait_confirmed",
+            "source": "wait_monitor",
+            "score": score,
+            "score_max": 15,
+            "entry_price": price,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "signal_time_utc": datetime.now().strftime("%H:%M:%S"),
+            "added_to_whitelist_at": datetime.now().isoformat(),
+            "confidence": confidence,
+            "verdict": "WAIT_CONFIRMED",
+        }
+        logger.info(f"✅ WAIT CONFIRMED: {symbol} {direction} @ ${price} (confidence={confidence}/10)")
+        return {"type": "entry", "data": signal}
+    
+    # Обычный формат
     title_match = re.search(r'📊\s+(\w+)\s+(LONG|SHORT)\s+\|\s+(✅|⏳|🚫)\s*(\w+)(?:\s*\(([0-9-]+)/10\))?', title)
     if not title_match:
         return None
@@ -72,6 +186,14 @@ def parse_ntfy_message(message: str, title: str) -> dict:
     score = int(score_match.group(1))
     phase = phase_match.group(1) if phase_match else None
     
+    # Извлекаем рекомендации из message (для парсинга условий)
+    lines = message.split('\n')
+    recommendations = []
+    for line in lines:
+        line = line.strip()
+        if line.startswith('⏳') or line.startswith('1️⃣') or line.startswith('2️⃣') or line.startswith('3️⃣') or line.startswith('4️⃣'):
+            recommendations.append(line)
+    
     # Создаём базовый объект сигнала
     signal_base = {
         "symbol": symbol,
@@ -82,18 +204,25 @@ def parse_ntfy_message(message: str, title: str) -> dict:
         "verdict": verdict,
         "phase": phase,
         "timestamp": datetime.now().isoformat(),
-        "message": message
+        "message": message,
+        "recommendations": recommendations  # Для справки
     }
     
     # Сигналы "ЖДАТЬ" → в wait_queue
     if "ЖДАТЬ" in verdict or verdict_emoji == "⏳":
-        logger.info(f"⏳ WAIT signal: {symbol} {direction} → wait_queue")
+        # Парсим условия из рекомендаций
+        conditions = parse_wait_conditions(recommendations, direction)
+        signal_base['conditions'] = conditions
+        logger.info(f"⏳ WAIT signal: {symbol} {direction} → wait_queue (conditions={len(conditions)})")
         return {"type": "wait", "data": signal_base}
     
     # FIX (16.09.2026): Confidence < 6 = ЖДАТЬ, не ВХОДИТЬ!
     # Баг: сигналы с confidence=5 попадали в Фунтик с verdict="ВХОДИТЬ"
     if confidence < 6:
-        logger.info(f"⏳ LOW confidence {confidence}/10: {symbol} {direction} → wait_queue (автоперевод в ЖДАТЬ)")
+        # Парсим условия из рекомендаций
+        conditions = parse_wait_conditions(recommendations, direction)
+        signal_base['conditions'] = conditions
+        logger.info(f"⏳ LOW confidence {confidence}/10: {symbol} {direction} → wait_queue (автоперевод в ЖДАТЬ, conditions={len(conditions)})")
         signal_base['verdict'] = 'ЖДАТЬ'
         signal_base['original_verdict'] = verdict
         signal_base['wait_reason'] = f'Низкая уверенность {confidence}/10 < 6'
@@ -174,7 +303,7 @@ def update_signals_file(new_signals: list):
     existing.extend(unique_new)
     
     # Оставляем только последние 50 сигналов
-    existing = existing[-50:]
+    existing = existing[-200:]
     
     # Записываем обратно
     OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -195,9 +324,15 @@ def update_wait_queue(wait_signals: list):
         except:
             existing = []
     
-    # Добавляем новые сигналы с полем added_at
+    # Добавляем новые сигналы с полем added_at и status
     for signal in wait_signals:
         signal['added_at'] = datetime.now().isoformat()
+        # 🔥 FIX: Добавляем обязательные поля для wait_queue_monitor
+        signal['status'] = 'waiting'
+        if 'signal_id' not in signal:
+            # Генерируем signal_id из данных
+            timestamp = signal.get('timestamp', datetime.now().isoformat()).replace(':', '').replace('-', '').replace('+', '').replace('.', '')[:14]
+            signal['signal_id'] = f"{signal['symbol']}_{signal['direction']}_{timestamp}"
     
     # Объединяем и удаляем дубликаты (по symbol+direction), оставляем САМЫЙ СВЕЖИЙ
     combined = existing + wait_signals
@@ -206,12 +341,23 @@ def update_wait_queue(wait_signals: list):
     combined.sort(key=lambda x: x.get('timestamp', ''))
     
     # Дедупликация: оставляем ПОСЛЕДНИЙ (самый свежий) сигнал для каждой пары symbol+direction
+    # 🔥 FIX: НЕ удаляем старые сигналы с status != 'waiting' (confirmed, expired)
     seen = {}
+    keep_old = []  # Старые сигналы НЕ в статусе waiting
+    
     for sig in combined:
+        status = sig.get('status', 'waiting')
+        
+        # Если сигнал НЕ waiting - сохраняем как есть (не дедуплицируем)
+        if status != 'waiting':
+            keep_old.append(sig)
+            continue
+        
+        # Для waiting сигналов - дедупликация по symbol+direction
         key = (sig['symbol'], sig['direction'])
         seen[key] = sig  # перезаписываем старые новыми
     
-    unique = list(seen.values())
+    unique = keep_old + list(seen.values())
     
     # Сохраняем
     WAIT_QUEUE_FILE.parent.mkdir(parents=True, exist_ok=True)
